@@ -1,0 +1,16 @@
+{
+  "name": "mv-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:e2e": "node tools/browser-test.mjs",
+    "test:ai": "node tools/browser-ai-test.mjs",
+    "test:concurrency": "node tools/browser-concurrency-test.mjs",
+    "test:shots": "node tools/browser-shot-workbench.mjs",
+    "check:repository": "node tools/check-repository.mjs"
+  }
+}

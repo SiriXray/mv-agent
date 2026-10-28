@@ -1,0 +1,88 @@
+import {loadPlaywright} from './playwright-runtime.mjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {createApp, ROOT} from '../server.mjs';
+import {probe, run, binaries, normalizeClip, assemble} from '../lib/media.mjs';
+import {defaults, templatePlan} from '../lib/core.mjs';
+
+const {chromium}=loadPlaywright();
+const data=await fs.mkdtemp(path.join(os.tmpdir(),'mv-agent-browser-test-'));
+const fixtureVideo=path.join(data,'provider-fixture.mp4');
+await run(binaries().ffmpeg,['-nostdin','-v','error','-f','lavfi','-i','testsrc=size=512x512:rate=30','-t','15','-c:v','libx264','-pix_fmt','yuv420p',fixtureVideo]);
+let creates=0;
+const app=createApp({dataDir:data,env:{ENABLE_LIVE_GENERATION:'true',VIDU_API_KEY:'isolated-test-key'},engineOptions:{
+  providers:{async create(model,input){assert.equal(input.duration,15);assert.equal(input.resolution,'720p');return{id:'fixture-'+(++creates)};},async poll(){return{state:'succeeded',url:'https://fixture.example.com/video.mp4'};}},
+  media:{normalizeClip,assemble,async downloadVideo(_,output){await fs.mkdir(path.dirname(output),{recursive:true});await fs.copyFile(fixtureVideo,output);}}
+}});
+const imageId=app.store.id()+'.png',audioId=app.store.id()+'.wav';
+await run(binaries().ffmpeg,['-nostdin','-v','error','-f','lavfi','-i','testsrc=size=512x512','-frames:v','1',app.store.mediaPath(imageId)]);
+await run(binaries().ffmpeg,['-nostdin','-v','error','-f','lavfi','-i','sine=frequency=440:duration=8:sample_rate=48000',app.store.mediaPath(audioId)]);
+const img={file:imageId,kind:'image',mime:'image/png',width:512,height:512,url:'/media/'+imageId};
+const song={file:audioId,kind:'audio',duration:8,name:'fixture.wav',url:'/media/'+audioId};
+app.store.state.uploads[imageId]=img;app.store.state.uploads[audioId]=song;
+const project={...defaults({title:'夜航 · 自动测试',resolution:'720p',planner:'llm',audio:song,assets:[{...img,asset_id:'fixture-asset',asset_name:'测试图',asset_description:'彩色条纹测试图案',type:'scene'}],lyrics:'[00:00.00]夜航\n[00:04.00]灯光'}),id:app.store.id(),revision:1,updatedAt:new Date().toISOString()};
+project.plan=templatePlan(project);app.store.state.projects[project.id]=project;app.store.save();
+await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+const base=`http://127.0.0.1:${app.server.address().port}`;
+const artifacts=path.join(ROOT,'artifacts');await fs.mkdir(artifacts,{recursive:true});
+const browser=await chromium.launch({headless:true});
+try{
+  const page=await browser.newPage({viewport:{width:1500,height:1050},deviceScaleFactor:1});
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',dialog=>dialog.accept());
+  await page.goto(base);await page.locator('.hero').waitFor();
+  await page.locator('[data-view="studio"]').click();await page.locator('[data-field="title"]').waitFor();
+  assert.equal(await page.title(),'🎶 MV Agent · 音乐影像工作台');
+  assert.equal(await page.locator('link[rel="icon"]').getAttribute('href'),'/favicon.svg?v=music-2');
+  assert.equal(await page.locator('[data-action="demo"]').count(),0);
+  await page.screenshot({path:path.join(artifacts,'studio-desktop.png'),fullPage:true});
+  await page.locator('[data-step="1"]').click();
+  await page.locator('.storyboard').first().waitFor({timeout:30000});
+  assert.equal(await page.locator('.storyboard').count(),2);
+  await page.screenshot({path:path.join(artifacts,'storyboard-desktop.png'),fullPage:true});
+  const duration=page.locator('[data-shot="0"][data-key="duration"]');
+  const originalDuration=await duration.inputValue();
+  await duration.fill('2.5');await page.locator('[data-action="save"]').click();
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('整数'));
+  await duration.fill(originalDuration);await page.locator('[data-action="save"]').click();
+  await page.waitForFunction(()=>!document.body.classList.contains('busy'));
+  await page.locator('[data-action="to-generation"]').click();await page.locator('.route-row').first().waitFor();
+  assert.equal(await page.locator('.route-row').count(),2);
+  assert.equal(await page.locator('#execution').count(),0);
+  await page.locator('[data-action="generate"]').click();
+  await page.locator('video[aria-label="任务组装文件"]').waitFor({timeout:120000});
+  await page.locator('video').evaluate(v=>v.load());
+  const video=page.locator('video'),videoUrl=await video.getAttribute('src');
+  await page.waitForFunction(()=>document.querySelector('video')?.readyState>=1);
+  const metadata=await video.evaluate(v=>({duration:v.duration,width:v.videoWidth,height:v.videoHeight}));
+  assert.ok(Math.abs(metadata.duration-8)<.2);assert.equal(metadata.width,1280);assert.equal(metadata.height,720);
+  const info=await probe(app.store.mediaPath(videoUrl.split('/').at(-1)));
+  assert.equal(info.streams.find(s=>s.codec_type==='video').codec_name,'h264');assert.equal(info.streams.find(s=>s.codec_type==='audio').codec_name,'aac');
+  const response=await fetch(base+videoUrl,{headers:{Range:'bytes=0-99'}});assert.equal(response.status,206);assert.equal((await response.arrayBuffer()).byteLength,100);
+  const suffix=await fetch(base+videoUrl,{headers:{Range:'bytes=-50'}});assert.equal(suffix.status,206);assert.equal((await suffix.arrayBuffer()).byteLength,50);
+  await video.evaluate(async v=>{v.muted=true;await v.play();});
+  await page.waitForFunction(()=>document.querySelector('video')?.currentTime>1);
+  await video.evaluate(v=>v.pause());
+  await page.screenshot({path:path.join(artifacts,'export-desktop.png'),fullPage:true});
+  await page.locator('[data-view="models"]').click();await page.locator('.model-card').first().waitFor();
+  assert.equal(await page.locator('.model-card').count(),7);assert.equal(await page.getByText('MIX',{exact:true}).count(),0);
+  await page.locator('[data-metric="wan3"][data-key="costPerSecond"]').fill('0.42');await page.locator('[data-action="save-metrics"]').click();
+  await page.waitForFunction(()=>!document.body.classList.contains('busy'));await page.screenshot({path:path.join(artifacts,'models-desktop.png'),fullPage:true});
+  await page.locator('[data-view="production"]').click();await page.locator('#production-form').waitFor();
+  await page.locator('[name="script_name"]').fill('夜航');await page.locator('[name="script_content"]').fill('一位白衣青年走在海边的小路上，随着夜色渐深，他看见远处灯塔的光芒，最终平静地停下脚步。');
+  await page.locator('[data-action="production-preview"]').click();await page.waitForFunction(()=>document.querySelector('#production-preview').textContent.includes('image_uri'));
+  await page.locator('[data-view="studio"]').click();await page.locator('[data-step="0"]').click();
+  await page.setViewportSize({width:390,height:844});
+  await page.screenshot({path:path.join(artifacts,'studio-mobile.png'),fullPage:true});
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),'mobile horizontal overflow');
+  await page.reload();await page.locator('.hero').waitFor();
+  await page.locator('[data-view="studio"]').click();await page.locator('[data-field="title"]').waitFor();
+  assert.equal(await page.locator('[data-field="title"]').inputValue(),'夜航 · 自动测试');
+  assert.deepEqual(errors,[]);assert.equal(creates,2);
+  const results={status:'passed',date:new Date().toISOString(),checks:['desktop and 390px mobile layout','isolated seeded assets','existing storyboard edit','invalid duration rejection','route inspection','live-only UI with injected test provider; zero external requests','H264 AAC 1280x720 8-second export','browser video playback progresses','HTTP byte and suffix ranges','metric persistence','production request preview','project reload persistence','no browser runtime errors'],video:metadata};
+  await fs.writeFile(path.join(artifacts,'browser-test-results.json'),JSON.stringify(results,null,2));console.log(JSON.stringify(results,null,2));
+}finally{
+  await browser.close();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));
+  assert.ok(path.resolve(data).startsWith(path.resolve(os.tmpdir())+path.sep));assert.ok(path.basename(data).startsWith('mv-agent-browser-test-'));await fs.rm(data,{recursive:true,force:true});
+}

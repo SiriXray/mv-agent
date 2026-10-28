@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {randomUUID, createHash} from 'node:crypto';
+import {run, binaries, normalizeClip} from '../lib/media.mjs';
+import {finalizeMv, verifyAvSync} from '../lib/av-sync.mjs';
+
+test('completed MV alignment repairs legacy output once, preserves source/database and rejects incomplete jobs or wrong audio', async t=>{
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'mv-av-finalize-test-')),media=path.join(dir,'media');
+  t.after(async()=>{assert.ok(path.basename(dir).startsWith('mv-av-finalize-test-'));assert.ok(path.resolve(dir).startsWith(path.resolve(os.tmpdir())+path.sep));await fs.rm(dir,{recursive:true,force:true});});
+  await fs.mkdir(media);const ffmpeg=binaries().ffmpeg,duration=3.275,jobId=randomUUID();
+  const song=randomUUID()+'.wav',legacy=randomUUID()+'.mp4',clips=[randomUUID()+'.mp4',randomUUID()+'.mp4'];
+  await run(ffmpeg,['-nostdin','-v','error','-f','lavfi','-i',`aevalsrc=0.2*sin(2*PI*(330*t+100*t*t)):s=48000:d=${duration}`,'-c:a','pcm_s16le',path.join(media,song)]);
+  await run(ffmpeg,['-nostdin','-v','error','-f','lavfi','-i','color=c=blue:s=320x180:r=30','-f','lavfi','-i','sine=frequency=880:sample_rate=48000','-t','4','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac',path.join(media,legacy)]);
+  const project={resolution:'720p',aspect_ratio:'16:9',audio:{file:song,duration},plan:{storyboards:[{id:0,duration:2},{id:1,duration:2}]}};
+  await normalizeClip(path.join(media,legacy),path.join(media,clips[0]),{duration:2},project,undefined,{}, {duration:4});
+  await fs.copyFile(path.join(media,clips[0]),path.join(media,clips[1]));
+  const job={id:jobId,status:'succeeded',output:legacy,snapshot:project,shots:clips.map((output,id)=>({id,state:'succeeded',output}))};
+  const database={jobs:{[jobId]:job}},dbFile=path.join(dir,'store.json');await fs.writeFile(dbFile,JSON.stringify(database));
+  const before=await fs.readFile(dbFile,'utf8'),hash=buffer=>createHash('sha256').update(buffer).digest('hex'),legacyHash=hash(await fs.readFile(path.join(media,legacy)));
+  const result=await finalizeMv(dir,jobId);assert.equal(result.realigned,true);assert.notEqual(result.file,legacy);assert.equal(result.verification.originalSongMatched,true);
+  assert.ok(result.verification.audioVideoEndDifference<=1/30+.001);assert.equal(await fs.readFile(dbFile,'utf8'),before);assert.equal(hash(await fs.readFile(path.join(media,legacy))),legacyHash);
+  const files=await fs.readdir(media),second=await finalizeMv(dir,jobId);assert.equal(second.reused,true);assert.equal(second.file,result.file);assert.deepEqual(await fs.readdir(media),files);
+  const wrongSong=path.join(dir,'wrong-song.wav');await run(ffmpeg,['-nostdin','-v','error','-f','lavfi','-i','anullsrc=r=48000:cl=mono','-t',String(duration),'-c:a','pcm_s16le',wrongSong]);
+  await assert.rejects(verifyAvSync(result.path,wrongSong,project),/零偏移/);
+  job.status='needs_attention';job.shots[1].state='needs_attention';await fs.writeFile(dbFile,JSON.stringify(database));
+  await assert.rejects(finalizeMv(dir,jobId),/分镜尚未全部完成/);assert.deepEqual(await fs.readdir(media),files);
+});

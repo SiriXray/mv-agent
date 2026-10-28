@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+data/
+source-notes/
+artifacts/
+node_modules/
+__pycache__/
+*.log
+*.pem
+*.key
+coverage/
+playwright-report/
+test-results/
+# Local design snapshots, source research and historical operations notes.
+/design-preview/
+/CLOUD_DEPLOYMENT.md
+/TEAM_DEPLOYMENT.md
+/tools/build-design-preview.mjs
+/tools/test-design-preview.mjs
+/tools/read_sources.py
+/tools/render-explainer.mjs
